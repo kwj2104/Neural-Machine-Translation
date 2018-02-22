@@ -10,17 +10,19 @@ from torch.autograd import Variable
 import torch.nn.functional as F
 import torch.optim as optim
 from tqdm import tqdm
+import pickle
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--devid", type=int, default=-1)
 
     parser.add_argument("--model", choices=["Soft"], default="Soft")
+    parser.add_argument("--preprocess", choices=["On", "Off"], default="Off")
     
     parser.add_argument("--minfreq", type=int, default=5)
     parser.add_argument("--sentlen", type=int, default=20)
     
-    parser.add_argument("--nhid", type=int, default=256)
+    parser.add_argument("--nhid", type=int, default=1000)
     parser.add_argument("--embdim", type=int, default=620)
     parser.add_argument("--nlayers", type=int, default=1)
     parser.add_argument("--maxout", type=int, default=1000)
@@ -32,13 +34,14 @@ def parse_args():
 
     parser.add_argument("--optim", choices=["SGD", "Adam"], default="Adam")
 
-    parser.add_argument("--lr", type=float, default=0.01)
+    parser.add_argument("--lr", type=float, default=0.000001)
+    parser.add_argument("--rho", type=float, default=0.95)
     parser.add_argument("--lrd", type=float, default=0.25)
     parser.add_argument("--wd", type=float, default=1e-4)
 
     parser.add_argument("--bsize", type=int, default=32)
     parser.add_argument("--bptt", type=int, default=32)
-    parser.add_argument("--clip", type=float, default=5)
+    parser.add_argument("--clip", type=float, default=1)
 
     # Adam parameters
     parser.add_argument("--b1", type=float, default=0.9)
@@ -56,41 +59,96 @@ if args.devid >= 0:
     torch.backends.cudnn.enabled = False
     print("Cudnn is enabled: {}".format(torch.backends.cudnn.enabled))
 
-#Setup Dataset
-spacy_de = spacy.load('de')
-spacy_en = spacy.load('en')
+def preprocess():
+    
+    print("Preprocessing Data")
+    
+    #Setup Dataset
+    spacy_de = spacy.load('de')
+    spacy_en = spacy.load('en')
+    
+    def tokenize_de(text):
+        return [tok.text for tok in spacy_de.tokenizer(text)]
+    
+    def tokenize_en(text):
+        return [tok.text for tok in spacy_en.tokenizer(text)]
+    
+    #Add beginning and end tokens to target sentences
+    BOS_WORD = '<s>'
+    EOS_WORD = '</s>'
+    DE = data.Field(tokenize=tokenize_de)
+    EN = data.Field(tokenize=tokenize_en, init_token = BOS_WORD, eos_token = EOS_WORD) # only target needs BOS/EOS
+    
+    train, val, test = datasets.IWSLT.splits(exts=('.de', '.en'), fields=(DE, EN), 
+                                             filter_pred=lambda x: len(vars(x)['src']) <= args.sentlen and 
+                                             len(vars(x)['trg']) <= args.sentlen)
+    
+    #Replace tokens that appear less than minfreq times as <unk>
+    DE.build_vocab(train.src, min_freq=args.minfreq)
+    EN.build_vocab(train.trg, min_freq=args.minfreq)
+    
+    vocab = [DE.vocab, EN.vocab]
+    
+    train_iter, val_iter = data.BucketIterator.splits((train, val), batch_size=args.bsize, device=args.devid,
+                                                      repeat=False, sort_key=lambda x: len(x.src))
+    
+    train_x = []
+    train_y = []
+    for batch in tqdm(train_iter):
+        train_x.append(batch.src)
+        train_y.append(batch.trg)
+        
+    val_x = []
+    val_y = []
+    for batch in tqdm(val_iter):
+        val_x.append(batch.src)
+        val_y.append(batch.trg)
+    
+    with open('train_x.pkl', 'wb') as output:  # Overwrites any existing file.
+        pickle.dump(train_x, output, pickle.HIGHEST_PROTOCOL)
+    
+        
+    with open('train_y.pkl', 'wb') as output:  # Overwrites any existing file.
+        pickle.dump(train_y, output, pickle.HIGHEST_PROTOCOL)
+    
+    with open('val_x.pkl', 'wb') as output:  # Overwrites any existing file.
+        pickle.dump(val_x, output, pickle.HIGHEST_PROTOCOL)
+        
+    with open('val_y.pkl', 'wb') as output:  # Overwrites any existing file.
+        pickle.dump(val_y, output, pickle.HIGHEST_PROTOCOL)
+        
+    with open('vocab.pkl', 'wb') as output:  # Overwrites any existing file.
+        pickle.dump(vocab, output, pickle.HIGHEST_PROTOCOL)
+    
+    print("Data Loaded")
+    
+def load_data():
+    pkl_train_x = open('train_x.pkl', 'rb')
+    pkl_train_y = open('train_y.pkl', 'rb')
+    pkl_val_x = open('val_x.pkl', 'rb')
+    pkl_val_y = open('val_y.pkl', 'rb')
+    pkl_vocab = open('vocab.pkl', 'rb')
 
-def tokenize_de(text):
-    return [tok.text for tok in spacy_de.tokenizer(text)]
-
-def tokenize_en(text):
-    return [tok.text for tok in spacy_en.tokenizer(text)]
-
-#Add beginning and end tokens to target sentences
-BOS_WORD = '<s>'
-EOS_WORD = '</s>'
-DE = data.Field(tokenize=tokenize_de)
-EN = data.Field(tokenize=tokenize_en, init_token = BOS_WORD, eos_token = EOS_WORD) # only target needs BOS/EOS
-
-train, val, test = datasets.IWSLT.splits(exts=('.de', '.en'), fields=(DE, EN), 
-                                         filter_pred=lambda x: len(vars(x)['src']) <= args.sentlen and 
-                                         len(vars(x)['trg']) <= args.sentlen)
-
-#Replace tokens that appear less than minfreq times as <unk>
-DE.build_vocab(train.src, min_freq=args.minfreq)
-EN.build_vocab(train.trg, min_freq=args.minfreq)
-
-#Find pad token
-padidx_en = EN.vocab.stoi["<pad>"]
-
-train_iter, val_iter = data.BucketIterator.splits((train, val), batch_size=args.bsize, device=args.devid,
-                                                  repeat=False, sort_key=lambda x: len(x.src))
+    train_x = pickle.load(pkl_train_x)
+    train_y = pickle.load(pkl_train_y)
+    val_x = pickle.load(pkl_val_x)
+    val_y = pickle.load(pkl_val_y)
+    de_vocab, en_vocab = pickle.load(pkl_vocab)
+    
+    pkl_train_x.close()
+    pkl_train_y.close()
+    pkl_val_x.close()
+    pkl_val_y.close()
+    pkl_vocab.close()
+    
+    return train_x, train_y, val_x, val_y, de_vocab, en_vocab
 
 
 class AttnNetwork(nn.Module):
-    def __init__(self, vocab_size_de, vocab_size_en, word_dim=args.embdim, hidden_dim=args.nhid, n_layers=args.nlayers, maxout=args.maxout):
+    def __init__(self, vocab_size_de, vocab_size_en, word_dim=args.embdim, hidden_dim=args.nhid, n_layers=args.nlayers, maxout=args.maxout, batch_size=args.bsize):
         super(AttnNetwork, self).__init__()
         self.hidden_dim = hidden_dim
+        self.batch_size = batch_size
         self.encoder = nn.LSTM(word_dim, hidden_dim, num_layers = args.nlayers, batch_first = True)
         self.decoder = nn.LSTM(word_dim, hidden_dim, num_layers = args.nlayers, batch_first = True)
         self.embedding_de = nn.Embedding(vocab_size_de, word_dim)
@@ -107,45 +165,41 @@ class AttnNetwork(nn.Module):
         self.linear_C = nn.Linear(hidden_dim, 2*maxout)
         
         #Maxout hidden layer
-        self.linear_W(maxout, vocab_size_en)
+        self.linear_W = nn.Linear(maxout, vocab_size_en)
         
         #self.vocab_layer = nn.Sequential(nn.Linear(hidden_dim*2, hidden_dim),
         #                                 nn.Tanh(), nn.Linear(hidden_dim, vocab_size_en), nn.LogSoftmax())
         
-        #Need to Test dimensions...
-        self.logsoftmax = nn.LogSoftmax()
+        self.logsoftmax = nn.LogSoftmax(dim=1)
         
     def forward(self, x, y, criterion, attn_type=args.model):
-        emb_en = self.embedding_de(x) # Bsize x Sent Len x Emb Size 
-        emb_de = self.embedding_en(y)
-        h0 = Variable(torch.zeros(1, x.size(0), self.hidden_dim)) #1 x Bsize x Hidden Dim
-        c0 = Variable(torch.zeros(1, x.size(0), self.hidden_dim))
-
-        enc_h, _ = self.encoder(emb_de, (h0, c0)) #10x4x300; bsize x sent len x hidden
-        dec_h, _ = self.decoder(emb_en[:, :-1], (h0, c0)) #10x3x300; bsize x sent len -1  x hidden 
+        emb_de = self.embedding_de(x) # Bsize x Sent Len x Emb Size 
+        emb_en = self.embedding_en(y)
+        
+        h0 = Variable(torch.zeros(1, x.size(0), self.hidden_dim).type_as(emb_de.data)) #1 x Bsize x Hidden Dim
+        c0 = Variable(torch.zeros(1, x.size(0), self.hidden_dim).type_as(emb_de.data))
+        enc_h, _ = self.encoder(emb_de, (h0, c0)) #32x16x1000; bsize x sent len x hidden
+        dec_h, _ = self.decoder(emb_en[:, :-1], (h0, c0)) #32x21x1000; bsize x sent len -1  x hidden 
       
-        scores = torch.bmm(enc_h, dec_h.transpose(1,2)) #this will be a batch x source_len x target_len (10x4x3)
-
-
-        loss = 0
-        avg_reward = 0        
+        scores = torch.bmm(enc_h, dec_h.transpose(1,2)) #this will be a batch x source_len x target_len (32x16x21)
+        
+        loss = 0     
         for t in range(dec_h.size(1)):            
             attn_dist = F.softmax(scores[:, :, t], dim=1) #get attention score
-            context = torch.bmm(attn_dist.unsqueeze(1), enc_h).squeeze(1)
+            context = torch.bmm(attn_dist.unsqueeze(1), enc_h).squeeze(1) #batch x hidden (32x1000)
             #pred = self.vocab_layer(torch.cat([dec_h[:, t], context], 1)) #10x300 + 10x300 -> 10x600 -> 10x300 -> Tanh -> 10xvocab size, 10x50
             label = y[:, t+1] #this will be our label
             
             #Deep output with a single maxout layer
-            t = self.linear_U(dec_h[:, t]) + self.linear_V(label) + self.linear_C(context)
-            t, _ = torch.max(t.view(-1, 2), 1)
+            #(32x2000)
+            t = self.linear_U(dec_h[:, t]) + self.linear_V(self.embedding_en(label)) + self.linear_C(context)
+            t, _ = torch.max(t.view(self.batch_size, -1, 2), 2)
+            
             pred = self.logsoftmax(self.linear_W(t))
             
-            reward = -1 * criterion(pred, label)
-            avg_reward += reward.data[0]
-            #reward = torch.gather(pred, 1, y.unsqueeze(1))  #our reward is log prob at the word level
-            #avg_reward += reward.data.mean()                              
-            loss -= reward.mean()       
-        avg_reward = avg_reward/dec_h.size(1)
+            reward = criterion(pred, label)
+            
+            loss += reward                               
         return loss
     
     #predict with greedy decoding
@@ -174,44 +228,54 @@ class AttnNetwork(nn.Module):
     def predict_beam(self, x, attn_type = args.model):
         pass
 
-def train(train_iter, model, criterion, optim):
+def train(train_iter, model, criterion, optimizer):
     model.train()
     total_loss = 0
-    for batch in tqdm(train_iter):
-        x = batch.src.transpose(0, 1)
-        y = batch.trg.transpose(0, 1)
-        optim.zero_grad()
+    for x, y in tqdm(train_iter):
+        x = x.transpose(0, 1)
+        y = y.transpose(0, 1)
+        optimizer.zero_grad()
         bloss = model.forward(x, y, criterion)
         #correct = torch.sum(y_pred.data[:, 1:] == y.data[:, 1:]) #exclude <s> token in acc calculation    
         bloss.backward()
-        torch.nn.utils.clip_grad_norm(model.parameters(), 1)
-        optim.step()        
+        torch.nn.utils.clip_grad_norm(model.parameters(), args.clip)
+        optimizer.step()        
         total_loss += bloss.data[0]
     return total_loss
         
-def validate(val_iter, model, criterion, optim):
+def validate(val_iter, model, criterion):
     model.eval()
     total_loss = 0
-    for batch in val_iter:
-        x = batch.src.transpose(0, 1)
-        y = batch.trg.transpose(0, 1)
+    for x, y in val_iter:
+        x = x.transpose(0, 1)
+        y = y.transpose(0, 1)
         bloss = model.forward(x, y, criterion)
    
         total_loss += bloss.data[0]
     return total_loss
         
 if __name__ == "__main__":
-    model = AttnNetwork(len(DE.vocab), len(EN.vocab))
+    if args.preprocess == "On":
+        preprocess()
+    
+    train_x, train_y, val_x, val_y, de_vocab, en_vocab = load_data()
+    train_iter = zip(train_x, train_y)
+    val_iter = zip(val_x, val_y)
+    
+    model = AttnNetwork(len(de_vocab), len(en_vocab))
+    
     if args.devid >= 0:
         model.cuda(args.devid)
     
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.5)
+    optimizer = torch.optim.Adadelta(model.parameters(), lr=args.lr, rho=args.rho)
     
-    schedule = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, patience=1, factor=args.lrd, threshold=1e-3)
+#    schedule = optim.lr_scheduler.ReduceLROnPlateau(
+#        optimizer, patience=1, factor=args.lrd, threshold=1e-3)
     
     # We do not want to give the model credit for predicting padding symbols,
-    weight = torch.FloatTensor(len(EN.vocab)).fill_(1)
+    #Find pad token
+    padidx_en = en_vocab.stoi["<pad>"]
+    weight = torch.FloatTensor(len(en_vocab)).fill_(1)
     weight[padidx_en] = 0
     if args.devid >= 0:
         weight = weight.cuda(args.devid)
@@ -222,14 +286,15 @@ if __name__ == "__main__":
     for i in range(args.epochs):
         print("Epoch {}".format(i))
         train_loss = train(train_iter, model, criterion, optimizer)
-        valid_loss = validate(val_iter, model, criterion, optimizer)
-        schedule.step(valid_loss)
-        raise Exception()
+        valid_loss = validate(val_iter, model, criterion)
+        #schedule.step(valid_loss)
+        #optimizer.step()
+        print("Training: {} Validation: {}".format(train_loss, valid_loss))
         #print("Training: {} Validation: {}".format(math.exp(train_loss/train_num.data[0]), math.exp(valid_loss/val_num.data[0])))    
 
     print()
     print("TESTING:")
-    test_loss, test_num= validate(model, criterion, optimizer, val_iter)
+    test_loss, test_num= validate(val_iter, model, criterion)
     #print("Test: {}".format(math.exp(test_loss/test_num.data[0])))
 
 

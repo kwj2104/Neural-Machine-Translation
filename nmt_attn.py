@@ -154,6 +154,11 @@ class AttnNetwork(nn.Module):
         self.embedding_de = nn.Embedding(vocab_size_de, word_dim)
         self.embedding_en = nn.Embedding(vocab_size_en, word_dim)
         
+        #Additive Attention Mechanism
+        self.linear_Wa = nn.Linear(hidden_dim, hidden_dim)
+        self.linear_Ua = nn.Linear(hidden_dim, hidden_dim)
+        self.linear_Va = nn.Linear(hidden_dim, 1)
+        
         #Transformation on s_t-1
         self.linear_U = nn.Linear(hidden_dim, 2*maxout)
         
@@ -167,8 +172,6 @@ class AttnNetwork(nn.Module):
         #Maxout hidden layer
         self.linear_W = nn.Linear(maxout, vocab_size_en)
         
-        #self.vocab_layer = nn.Sequential(nn.Linear(hidden_dim*2, hidden_dim),
-        #                                 nn.Tanh(), nn.Linear(hidden_dim, vocab_size_en), nn.LogSoftmax())
         
         self.logsoftmax = nn.LogSoftmax(dim=1)
         
@@ -181,19 +184,31 @@ class AttnNetwork(nn.Module):
         enc_h, _ = self.encoder(emb_de, (h0, c0)) #32x16x1000; bsize x sent len x hidden
         dec_h, _ = self.decoder(emb_en[:, :-1], (h0, c0)) #32x21x1000; bsize x sent len -1  x hidden 
       
-        scores = torch.bmm(enc_h, dec_h.transpose(1,2)) #this will be a batch x source_len x target_len (32x16x21)
+        #scores = torch.bmm(enc_h, dec_h.transpose(1,2)) #this will be a batch x source_len x target_len (32x16x21)
+        
+
+        Wa = self.linear_Wa(dec_h)
+        Ua = self.linear_Ua(enc_h)
+        
+        scores = Variable(torch.zeros(x.size(0), Ua.size(1), Wa.size(1), self.hidden_dim).type_as(emb_de.data))
+        for b in range(Wa.size(0)):
+            for i in range(Ua.size(1)):
+                for j in range(Wa.size(1)):
+                    scores[b, i, j, :] = (Wa[b, j, :] + Ua[b, i, :]).data[0]
+
+        scores = self.linear_Va(F.tanh(scores)).squeeze(3)
         
         loss = 0     
         for t in range(dec_h.size(1)):            
             attn_dist = F.softmax(scores[:, :, t], dim=1) #get attention score
             context = torch.bmm(attn_dist.unsqueeze(1), enc_h).squeeze(1) #batch x hidden (32x1000)
-            #pred = self.vocab_layer(torch.cat([dec_h[:, t], context], 1)) #10x300 + 10x300 -> 10x600 -> 10x300 -> Tanh -> 10xvocab size, 10x50
-            label = y[:, t+1] #this will be our label
+            label = y[:, t+1] #start with one word forward since first word is start of sent token
             
             #Deep output with a single maxout layer
-            #(32x2000)
-            t = self.linear_U(dec_h[:, t]) + self.linear_V(self.embedding_en(label)) + self.linear_C(context)
-            t, _ = torch.max(t.view(self.batch_size, -1, 2), 2)
+            #(batchx2*maxout)
+            #Note linear_V takes y_i-1
+            t = self.linear_U(dec_h[:, t]) + self.linear_V(self.embedding_en(y[:, t])) + self.linear_C(context)
+            t, _ = torch.max(t.view(x.size(0), -1, 2), 2)
             
             pred = self.logsoftmax(self.linear_W(t))
             
@@ -205,14 +220,14 @@ class AttnNetwork(nn.Module):
     #predict with greedy decoding
     def predict(self, x, attn_type = args.model):
         
-        emb = self.embedding(x)
-        h = Variable(torch.zeros(1, x.size(0), self.hidden_dim))
-        c = Variable(torch.zeros(1, x.size(0), self.hidden_dim))
-        enc_h, _ = self.encoder(emb, (h, c))
+        emb_de = self.embedding_de(x)
+        h = Variable(torch.zeros(1, x.size(0), self.hidden_dim).type_as(emb_de.data))
+        c = Variable(torch.zeros(1, x.size(0), self.hidden_dim).type_as(emb_de.data))
+        enc_h, _ = self.encoder(emb_de, (h, c))
         y = [Variable(torch.zeros(x.size(0)).long())]
         self.attn = []        
         for t in range(x.size(1)):
-            emb_t = self.embedding(y[-1])
+            emb_t = self.embedding_en(y[-1])
             dec_h, (h, c) = self.decoder(emb_t.unsqueeze(1), (h, c))
             scores = torch.bmm(enc_h, dec_h.transpose(1,2)).squeeze(2)
             attn_dist = F.softmax(scores, dim = 1)
@@ -225,53 +240,82 @@ class AttnNetwork(nn.Module):
         return torch.stack(y, 0).transpose(0, 1)
     
     #predict with beam search
-    def predict_beam(self, x, attn_type = args.model):
+    def predict_beam(self, x, padidx_s, beam_size=5):
+        emb_de = self.embedding_de(x)
+        h = Variable(torch.zeros(1, x.size(0), self.hidden_dim).type_as(emb_de.data))
+        c = Variable(torch.zeros(1, x.size(0), self.hidden_dim).type_as(emb_de.data))
+        enc_h, _ = self.encoder(emb_de, (h, c))
+        
+        #initialize y with start of sentence token
+        y = [Variable(torch.zeros(x.size(0)).long().add_(padidx_s).type_as(emb_de.data))]
+
+        self.attn = []    
+        for t in range(x.size(1)):
+            emb_t = self.embedding_en(y[-1])
+            dec_h, (h, c) = self.decoder(emb_t.unsqueeze(1), (h, c))
+            scores = torch.bmm(enc_h, dec_h.transpose(1,2)).squeeze(2)
+            attn_dist = F.softmax(scores, dim = 1)
+            context = torch.bmm(attn_dist.unsqueeze(1), enc_h).squeeze(1)
+            
+            label = y[:, t+1] #start with one word forward since first word is start of sent token
+            
+            #Deep output with a single maxout layer
+            #(batchx2*maxout)
+            t = self.linear_U(dec_h[:, t]) + self.linear_V(self.embedding_en(label)) + self.linear_C(context)
+            t, _ = torch.max(t.view(x.size(0), -1, 2), 2)
+            
+            pred = self.logsoftmax(self.linear_W(t))
+            
         pass
 
 def train(train_iter, model, criterion, optimizer):
     model.train()
     total_loss = 0
+    total_batch = 0
     for x, y in tqdm(train_iter):
         x = x.transpose(0, 1)
         y = y.transpose(0, 1)
         optimizer.zero_grad()
-        bloss = model.forward(x, y, criterion)
-        #correct = torch.sum(y_pred.data[:, 1:] == y.data[:, 1:]) #exclude <s> token in acc calculation    
+        bloss = model.forward(x, y, criterion)   
         bloss.backward()
         torch.nn.utils.clip_grad_norm(model.parameters(), args.clip)
         optimizer.step()        
         total_loss += bloss.data[0]
-    return total_loss
+        total_batch += 1
+    return total_loss/total_batch
         
 def validate(val_iter, model, criterion):
     model.eval()
     total_loss = 0
+    total_batch = 0
     for x, y in val_iter:
         x = x.transpose(0, 1)
         y = y.transpose(0, 1)
         bloss = model.forward(x, y, criterion)
    
         total_loss += bloss.data[0]
-    return total_loss
+        total_batch += 1
+    return total_loss/total_batch
         
 if __name__ == "__main__":
     if args.preprocess == "On":
         preprocess()
     
     train_x, train_y, val_x, val_y, de_vocab, en_vocab = load_data()
-    train_iter = zip(train_x, train_y)
-    val_iter = zip(val_x, val_y)
+
     
     model = AttnNetwork(len(de_vocab), len(en_vocab))
     
     if args.devid >= 0:
         model.cuda(args.devid)
     
-    optimizer = torch.optim.Adadelta(model.parameters(), lr=args.lr, rho=args.rho)
+    optimizer = torch.optim.Adadelta(model.parameters(), rho=args.rho)
     
 #    schedule = optim.lr_scheduler.ReduceLROnPlateau(
 #        optimizer, patience=1, factor=args.lrd, threshold=1e-3)
-    
+    padidx_s = en_vocab.stoi["<s>"]
+    #model.predict_beam(train_x[0], padidx_s)
+
     # We do not want to give the model credit for predicting padding symbols,
     #Find pad token
     padidx_en = en_vocab.stoi["<pad>"]
@@ -284,18 +328,20 @@ if __name__ == "__main__":
     print()
     print("TRAINING:")
     for i in range(args.epochs):
+        train_iter = zip(train_x, train_y)
+        val_iter = zip(val_x, val_y)
         print("Epoch {}".format(i))
         train_loss = train(train_iter, model, criterion, optimizer)
         valid_loss = validate(val_iter, model, criterion)
         #schedule.step(valid_loss)
-        #optimizer.step()
         print("Training: {} Validation: {}".format(train_loss, valid_loss))
         #print("Training: {} Validation: {}".format(math.exp(train_loss/train_num.data[0]), math.exp(valid_loss/val_num.data[0])))    
 
     print()
     print("TESTING:")
-    test_loss, test_num= validate(val_iter, model, criterion)
-    #print("Test: {}".format(math.exp(test_loss/test_num.data[0])))
+    val_iter = zip(val_x, val_y)
+    test_loss = validate(val_iter, model, criterion)
+    print("Test: {}".format(test_loss))
 
 
     torch.save(model, 'model_attn.pt')

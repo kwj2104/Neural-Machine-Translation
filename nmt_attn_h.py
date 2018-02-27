@@ -206,13 +206,14 @@ class AttnNetwork(nn.Module):
         
         enc_h, (h0_enc, c0_enc) = self.encoder(emb_de, (h0_enc, c0_enc)) #32x16x1000; bsize x sent len x hidden
 
+
         #Need to change the initialized dec hidden state to the backwards layer of bilstm later...
         h0 = h0_enc[1, :, :].unsqueeze(0)
         c0 = c0_enc[1, :, :].unsqueeze(0)
         #h0 = h0_enc
         #c0 = c0_enc
 
-        dec_h, _ = self.decoder(emb_en[:, :-1], (h0, c0)) #32x21x1000; bsize x sent len -1  x hidden 
+        dec_h, (h_dec, c_dec) = self.decoder(emb_en[:, :-1], (h0, c0)) #32x21x1000; bsize x sent len -1  x hidden 
 
         #scores = torch.bmm(enc_h, dec_h.transpose(1,2)) #this will be a batch x source_len x target_len (32x16x21)
         
@@ -246,11 +247,11 @@ class AttnNetwork(nn.Module):
             reward = criterion(pred, label)
             
             loss += reward    
-                         
+                          
         return loss
     
     #predict with greedy decoding
-    def predict_greedy(self, x, padidx_s):
+    def predict_greedy(self, x, padidx_s, eosidx):
         model.eval()
         
         emb_de = self.embedding_de(x)
@@ -260,6 +261,9 @@ class AttnNetwork(nn.Module):
         enc_h, (h, c) = self.encoder(emb_de, (h_enc, c_enc))
         y = [Variable(torch.zeros(x.size(0)).add_(padidx_s).type_as(emb_de.data).long())]
         self.attn = []
+        
+        h = h[1, :, :].unsqueeze(0)
+        c = c[1, :, :].unsqueeze(0)
         
         for i in range(1, args.sentlen):
             emb_t = self.embedding_en(y[-1])
@@ -287,29 +291,33 @@ class AttnNetwork(nn.Module):
                 #print(y[2].data)
                 pass
         self.attn = torch.stack(self.attn, 0).transpose(0, 1)
-        return torch.stack(y, 0).transpose(0, 1)
+        return torch.stack(y, 0).transpose(0, 1).data
     
     #predict with beam search
     def predict_beam(self, x, padidx_s, en_len, beam_size=1):
         model.eval()
-
+        
         emb_de = self.embedding_de(x)
         h_enc = Variable(torch.zeros(self.nlayers_enc * self.bidirect, x.size(0), self.hidden_dim).type_as(emb_de.data)) #1 x Bsize x Hidden Dim
         c_enc = Variable(torch.zeros(self.nlayers_enc * self.bidirect, x.size(0), self.hidden_dim).type_as(emb_de.data))
         
-        enc_h, (h_enc, c_enc) = self.encoder(emb_de, (h_enc, c_enc))
+        enc_h, (h, c) = self.encoder(emb_de, (h_enc, c_enc))
         
         #initialize y with start of sentence token; len is + 2 to deal with begin and end sentence tokens
-        start_sen_tok = Variable(torch.zeros(x.size(0)).add_(padidx_s).type_as(emb_de.data).long())
+        start_sen_tok = Variable(torch.zeros(x.size(0), beam_size).add_(padidx_s).type_as(emb_de.data).long())
         self.attn = []  
+        
+        h = h[1, :, :].unsqueeze(0)
+        c = c[1, :, :].unsqueeze(0)
         
         #Create 3D tensor that represents batch x beam_size x predicted word indcies, of best current predictions
         running_beam = torch.zeros(x.size(0), beam_size, args.sentlen).type_as(emb_de.data).long()
+        #print(start_sen_tok.size())
         running_beam[:, :, 0]  = start_sen_tok.data
             
         # Find best beam_size (unique) first words
-        emb_t = self.embedding_en(start_sen_tok)
-        dec_h, (h, c) = self.decoder(emb_t.unsqueeze(1), (h_enc, c_enc))
+        emb_t = self.embedding_en(start_sen_tok[:, 0])
+        dec_h, (h, c) = self.decoder(emb_t.unsqueeze(1), (h, c))
         
         Ua = self.linear_Ua(enc_h)
         Wa = self.linear_Wa(dec_h)
@@ -329,6 +337,7 @@ class AttnNetwork(nn.Module):
         predk_probs = torch.gather(pred, 1, predk_indices) 
         
         running_beam[:, :, 1]  = predk_indices.data
+        
         
         #Create a list that keeps track of the hidden layers for each copy of the decoder
         # Initialize all 5 beams with decoder hidden state of first layer
@@ -367,11 +376,9 @@ class AttnNetwork(nn.Module):
             current_ind = torch.remainder(predk_indices, en_len)
             prev_ind = torch.div(predk_indices, en_len)
             
-            
             running_beam = running_beam[torch.arange(x.size(0)).type_as(x.data)[:, None], prev_ind, :].type_as(x.data)
-            running_beam[:, :, w] = current_ind
-            if w == 3:
-                print(running_beam[:, :, 3])            
+
+            running_beam[:, :, w] = current_ind          
         
         #_, max_indices = predk_probs.max(1)        
         #final_pred = running_beam[torch.arange(x.size(0)).type_as(x.data), max_indices.data, :].type_as(x.data)
@@ -395,18 +402,28 @@ def train(train_iter, model, criterion, optimizer, train_len):
 
     return total_loss
 
-def validate(val_iter, model, criterion, val_len, startosidx, eosidx):
+def validate(val_iter, model, criterion, val_len, startosidx, eosidx, en_vocab):
     model.eval()
     total_loss = 0
     total_bleu = 0
-    for x, y in val_iter:
+    nwords = 0
+    for x, y in tqdm(val_iter):
         x = x.transpose(0, 1)
         y = y.transpose(0, 1)
+        
+        nwords += y.ne(padidx_en).int().sum()
+        
         bloss = model.forward(x, y, criterion)
-        pred = model.predict_beam(x, startosidx, len(en_vocab))
-        total_bleu += sandbox_nmt.get_bleu(pred, y, eosidx) * (x.size(0) / val_len)
-        total_loss += bloss.data[0] * (x.size(0) / val_len)
-    return total_loss, total_bleu
+        #pred = model.predict_greedy(x, startosidx)
+        pred = model.predict_beam(x, startosidx, len(en_vocab), beam_size=5)
+        total_bleu += sandbox_nmt.get_bleu(pred, y, eosidx, en_vocab) * (x.size(0) / val_len)
+        total_loss += bloss.data[0]
+        #total_loss += bloss.data[0] * (x.size(0) / val_len)
+        #total_loss += (bloss.data[0] / val_len)
+
+    word_loss = total_loss/nwords.data[0]
+    
+    return word_loss, total_bleu
         
 if __name__ == "__main__":
     if args.preprocess == "On":
@@ -422,7 +439,7 @@ if __name__ == "__main__":
         val_len += val_x[i].size(1)
 
     model = AttnNetwork(len(de_vocab), len(en_vocab), dropout=args.dropout)
-    #model.load_state_dict(torch.load("model_attn_state.pth", map_location=lambda storage, loc: storage))
+    model.load_state_dict(torch.load("model_attn_state.pth", map_location=lambda storage, loc: storage))
     
     if args.devid >= 0:
         model.cuda(args.devid)
@@ -441,33 +458,38 @@ if __name__ == "__main__":
     weight[padidx_en] = 0
     if args.devid >= 0:
         weight = weight.cuda(args.devid)
-    criterion = nn.NLLLoss(weight=Variable(weight), size_average=True)
+    criterion = nn.NLLLoss(weight=Variable(weight), size_average=False)
     
     startosidx = en_vocab.stoi["<s>"]
     eosidx = en_vocab.stoi["</s>"]
-    model.eval()
+#    model.eval()
 #    final_pred1 = model.predict_beam(train_x[0].transpose(0, 1), startosidx, len(en_vocab)) 
-    model.forward(train_x[0].transpose(0, 1), train_y[0].transpose(0, 1), criterion)
-    final_pred2 = model.predict_greedy(train_x[0].transpose(0, 1), startosidx)
+    #model.forward(train_x[0].transpose(0, 1), train_y[0].transpose(0, 1), criterion)
+#    final_pred2 = model.predict_greedy(val_x[2].transpose(0, 1), startosidx)
+#    final_pred1 = model.predict_beam(val_x[2].transpose(0, 1), startosidx, len(en_vocab))
+#    total_bleu2 = sandbox_nmt.get_bleu(final_pred2, val_y[2].transpose(0, 1), eosidx, en_vocab)
+#    print()
+#    print()
+#    total_bleu1 = sandbox_nmt.get_bleu(final_pred1, val_y[2].transpose(0, 1), eosidx, en_vocab)
+#    raise Exception()
 
-#    print(torch.equal(final_pred1, final_pred2.data))
 
-    print()
-    print("TRAINING:")
-    for i in range(args.epochs):
-        train_iter = zip(train_x, train_y)
-        val_iter = zip(val_x, val_y)
-        print("Epoch {}".format(i))
-        train_loss = train(train_iter, model, criterion, optimizer, train_len)
-        valid_loss, bleu = validate(val_iter, model, criterion, val_len, startosidx, eosidx)
-        #schedule.step(valid_loss)
-        print("Training: {} Validation: {} Bleu: {}".format(train_loss, valid_loss, bleu))
+#    print()
+#    print("TRAINING:")
+#    for i in range(args.epochs):
+#        train_iter = zip(train_x, train_y)
+#        val_iter = zip(val_x, val_y)
+#        print("Epoch {}".format(i))
+#        train_loss = train(train_iter, model, criterion, optimizer, train_len)
+#        valid_loss, bleu = validate(val_iter, model, criterion, val_len, startosidx, eosidx)
+#        #schedule.step(valid_loss)
+#        print("Training: {} Validation: {} Bleu: {}".format(train_loss, valid_loss, bleu))
 
     print()
     print("TESTING:")
     val_iter = zip(val_x, val_y)
-    test_loss = validate(val_iter, model, criterion, val_len, startosidx, eosidx)
-    print("Test: {}".format(test_loss))
+    test_loss, bleu = validate(val_iter, model, criterion, val_len, startosidx, eosidx, en_vocab)
+    print("Test: {} Bleu: {}".format(math.exp(test_loss), bleu))
 
 
     torch.save(model.state_dict(), 'model_attn_state.pth')
